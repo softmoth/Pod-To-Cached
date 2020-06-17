@@ -11,6 +11,7 @@ enum Status is export <Current Valid Failed New Old>; # New is internally used, 
 
 has Str $.path = '.pod6-cache';
 has Str $.source = 'doc';
+has Bool $.lazy;
 has Bool $.verbose is rw;
 has $.precomp;
 has %.files;
@@ -19,7 +20,9 @@ has Bool $.frozen = False;
 has Str @.error-messages;
 has Lock $!lock .= new;
 
-submethod BUILD( :$!source = 'doc', :$!path = '.pod-cache', :$!verbose = False ) { }
+submethod BUILD( :$!source = 'doc', :$!path = '.pod-cache',
+    :$!lazy = False, :$!verbose = False )
+{ }
 
 submethod TWEAK {
 
@@ -28,7 +31,7 @@ submethod TWEAK {
         die '$!path has corrupt doc-cache' unless ("$!path/"~INDEX).IO ~~ :f;
         my %config;
         try {
-	    my $config-content = ("$!path/"~INDEX).IO.slurp;
+            my $config-content = ("$!path/"~INDEX).IO.slurp;
             %config = from-json($config-content);
             CATCH {
                 default {
@@ -43,19 +46,21 @@ submethod TWEAK {
                 and %config<files>.WHAT ~~ Hash
         ;
         $!frozen = %config<frozen> eq 'True';
-        %!files = %config<files>;
         unless $!frozen {
             die "Invalid index file"
                 unless %config<source>:exists;
             $!source = %config<source>;
-            for %!files.keys -> $f {
-                die "File $f has no status" if !%!files{$f}<status>;
-                %!files{$f}<status> = Status( Status.enums{%!files{$f}<status> }) ;
-                %!files{$f}<added> = DateTime.new( %!files{$f}<added> ).Instant
-            }
         }
+        %!files = %config<files>;
+        for %!files.keys -> $f {
+            %!files{$f}<status> = Status(Status.enums{ %!files{$f}<status> // '' });
+            die "File $f has no status" if not %!files{$f}<status>.defined;
+            %!files{$f}<added> = DateTime.new( %!files{$f}<added> ).Instant
+        }
+
+        # note a frozen cache always returns True
         die "Source verification failed with:\n" ~ @!error-messages.join("\n\t")
-            unless self.verify-source; # note a frozen cache always returns True
+            unless self.verify-source;
     }
     else {
         # check that a source exists before creating a cache
@@ -65,43 +70,108 @@ submethod TWEAK {
         mkdir IO::Path.new( $!path );
         self.save-index;
     }
+
     my $precomp-store = CompUnit::PrecompilationStore::File.new(prefix => $!path.IO );
     $!precomp = CompUnit::PrecompilationRepository::Document.new(store => $precomp-store);
-    # get handles for all Valid / Current files
 
-    for %!files.kv -> $nm, %info {
-        next unless %info<status> ~~ any( Valid, Current );
-        die "No handle for <$nm> in cache, but marked as existing. Cache corrupted."
-            without %!files{$nm}<handle> = $!precomp.load(%info<cache-key>)[0];
+    # get handles for all Valid / Current files
+    unless $!lazy {
+        self!load-from-cache($_) for %!files.keys
     }
+
     note "Got cache at $!path" if $!verbose;
+}
+
+method !load-from-cache(Str $name) {
+    note "Load '$name' from cache (%!files{$name}.raku())";
+    with %!files{$name} {
+        # XXX Is New OK here?
+        return Nil unless .<status> ~~ Valid | Current | New;
+        .<handle> = $!precomp.load(.<cache-key>)[0];
+        my $updates;
+        if (.<status> == New) {
+            given self.compile( $name, .<cache-key>, .<path>, .<status> ) {
+                if .<error>.defined {
+                    @!error-messages.push: .<error>;
+                    %!files{ .<source-name> }<status> = .<status> if .<status> ~~ Failed;
+                }
+                else {
+                    %!files{ .<source-name> }<handle status added> = .<handle>, .<status>, .<added>;
+                    $updates = True;
+                }
+            }
+        }
+        .<handle> or die "No handle for <$name> in cache, but marked as existing.",
+                    " Cache corrupted.";
+        self.save-index if $updates;
+    }
+}
+
+method !add-file-to-cache(Str $pod-file) {
+    my $nm = $!source eq "." ?? $pod-file !! $pod-file.substr($!source.chars + 1); # name from source root directory
+    # Normalise the cache name to lower case
+    $nm = $nm.subst(/ \. \w+ $/, '').lc;
+
+
+    note "Adding '$nm' ($pod-file) to cache ({ %!files{$nm} // 'NULL' })";
+    if %!files{$nm}:exists { # cannot use SetHash removal here because duplicates would then register as New
+        if %!files{$nm}<path> eq $pod-file {
+            note "Have the path: '%!files{$nm}<path>'";
+            # detect tainted source
+            %!files{$nm}<status> = Valid if %!files{$nm}<added> < %!files{$nm}<path>.IO.modified;
+        }
+        else {
+            note "Maybe duplicates --- XXX handle this via exception.";
+            @!error-messages.push("$pod-file duplicates name of " ~ %!files{$nm}<path> ~ " but with different extension");
+        }
+    }
+    else {
+        note "Adding new cache entry on the spot";
+        %!files{$nm} = (:cache-key(nqp::sha1($nm)), :path($pod-file), :status( New ), :added(0) ).hash;
+    }
+
+    $nm
+}
+
+method !find-pod-file-of-name(Str $name) {
+    die 'No files accessible for a frozen cache' if $!frozen; # should never get here
+
+    # Reverse-engineer add-file-to-cache name transform
+    my $path = $!source.IO;
+    my @parts = $name.split('/');
+    my $last = @parts.pop;
+    for @parts -> $part {
+        my $match = $path.dir(:test({ .lc eq $part }));
+        if $match != 1 {
+            # FIXME Need an exception here that can be caught
+            die "No match for '$part' in '$path'";
+        }
+        $path = $match.first;
+    }
+    my $match = $path.dir(:test({ .IO.extension('').lc eq $last }));
+    if $match != 1 {
+        # FIXME Need an exception here that can be caught
+        die "No match for '$last' in '$path'";
+    }
+
+    ~$match.first;
 }
 
 method verify-source( --> Bool ) {
     return True if $!frozen;
+
     (@!error-messages = "$!source is not a directory", ) and return False
         unless $!source.IO ~~ :d;
+    return True if $!lazy;
+
     (@!error-messages = "No POD files found under $!source", ) and return False
         unless self.get-pods;
-    my $rv = True;
+
+    @!error-messages = ();
+
     my SetHash $old .= new( %!files.keys );
     for @!pods -> $pfile {
-        my $nm = $!source eq "." ?? $pfile !! $pfile.substr($!source.chars + 1); # name from source root directory
-        # Normalise the cache name to lower case
-        $nm = $nm.subst(/ \. \w+ $/, '').lc;
-        if %!files{$nm}:exists { # cannot use SetHash removal here because duplicates would then register as New
-            if %!files{$nm}<path> eq $pfile {
-                # detect tainted source
-                %!files{$nm}<status> = Valid if %!files{$nm}<added> < %!files{$nm}<path>.IO.modified;
-            }
-            else {
-                @!error-messages.push("$pfile duplicates name of " ~ %!files{$nm}<path> ~ " but with different extension");
-                $rv = False ;
-            }
-        }
-        else {
-            %!files{$nm} = (:cache-key(nqp::sha1($nm)), :path($pfile), :status( New ), :added(0) ).hash;
-        }
+        my $nm = self!add-file-to-cache($pfile);
         $old{$nm}--;
     }
 
@@ -116,31 +186,28 @@ method verify-source( --> Bool ) {
         TODO cache garbage collection: remove from cache
 
     note 'Source verified' if $!verbose;
-    $rv
+
+    @!error-messages == 0
 }
 
 method update-cache( --> Bool ) {
     die 'Cannot update frozen cache' if $!frozen;
     @!error-messages = ();
-    my @compiled;
     my Bool $updates;
     for %!files.kv -> $source-name, %info {
         next if %info<status> ~~ Current;
-        my $res = self.compile( $source-name, %info<cache-key>, %info<path>, %info<status> );
-        @compiled.append: $res;
-    }
-
-    for @compiled {
-        if .<error>.defined {
-            @!error-messages.push: .<error>;
-            %!files{ .<source-name> }<status> = .<status> if .<status> ~~ Failed;
-        }
-        else {
-            %!files{ .<source-name> }<handle status added> = .<handle>, .<status>, .<added>;
-            $updates = True;
+        given self.compile( $source-name, %info<cache-key>, %info<path>, %info<status> ) {
+            if .<error>.defined {
+                @!error-messages.push: .<error>;
+                %!files{ .<source-name> }<status> = .<status> if .<status> ~~ Failed;
+            }
+            else {
+                %!files{ .<source-name> }<handle status added> = .<handle>, .<status>, .<added>;
+                $updates = True;
+            }
         }
     }
-    my $ret-ok = not ?@!error-messages;
+    my $ret-ok = ?@!error-messages;
     note( @!error-messages.join("\n")) if $!verbose and not $ret-ok;
     self.save-index if $updates;
     note ('Cache ' ~ ( $ret-ok ?? '' !! 'not ' ) ~ 'fully updated') if $!verbose;
@@ -210,9 +277,21 @@ method get-pods {
 }
 
 method pod( Str $source-name ) is export {
-    die "Source name ｢$source-name｣ not in cache" unless $source-name ~~ any(%!files.keys);
-    die "Attempt to obtain non-existent POD for <$source-name>. Is the source new and failed to compile? Has the cache been updated?"
-        without %!files{$source-name}<handle>;
+    unless %!files{$source-name}:exists {
+        if $!lazy {
+            my $pod-file = self!find-pod-file-of-name($source-name);
+            note "Found '$pod-file' for '$source-name'";
+            self!add-file-to-cache($pod-file);
+        }
+        else {
+            die "Source name ｢$source-name｣ not in cache";
+        }
+    }
+    self!load-from-cache($source-name) unless %!files{$source-name}<handle>:exists;
+    %!files{$source-name}<handle> or
+        die "Attempt to obtain non-existent POD for <$source-name>.",
+            " Is the source new and failed to compile?",
+            " Has the cache been updated?";
     nqp::atkey(%!files{$source-name}<handle>.unit,'$=pod');
 }
 
