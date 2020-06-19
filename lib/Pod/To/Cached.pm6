@@ -7,7 +7,7 @@ use CompUnit::PrecompilationRepository::Document;
 constant @extensions = <pod pod6 p6 pm pm6>;
 
 constant INDEX = 'file-index.json';
-enum Status is export <Current Valid Failed New Old>; # New is internally used, but not stored in DB
+enum Status is export <Failed Current Valid New Old>; # New is internally used, but not stored in DB
 
 has Str $.path = '.pod6-cache';
 has Str $.source = 'doc';
@@ -25,7 +25,6 @@ submethod BUILD( :$!source = 'doc', :$!path = '.pod-cache',
 { }
 
 submethod TWEAK {
-
     if $!path.IO ~~ :d {
         # cache path exists, so assume it should contain a cache
         die '$!path has corrupt doc-cache' unless ("$!path/"~INDEX).IO ~~ :f;
@@ -54,11 +53,11 @@ submethod TWEAK {
         %!files = %config<files>;
         for %!files.keys -> $f {
             %!files{$f}<status> = Status(Status.enums{ %!files{$f}<status> // '' });
-            die "File $f has no status" if not %!files{$f}<status>.defined;
+            die "File $f has no status" without %!files{$f}<status>;
             %!files{$f}<added> = DateTime.new( %!files{$f}<added> ).Instant
         }
 
-        # note a frozen cache always returns True
+        # Note: a frozen cache always returns True
         die "Source verification failed with:\n" ~ @!error-messages.join("\n\t")
             unless self.verify-source;
     }
@@ -83,12 +82,10 @@ submethod TWEAK {
 }
 
 method !load-from-cache(Str $name) {
-    note "Load '$name' from cache (%!files{$name}.raku())";
     with %!files{$name} {
         # XXX Is New OK here?
         return Nil unless .<status> ~~ Valid | Current | New;
         .<handle> = $!precomp.load(.<cache-key>)[0];
-        my $updates;
         if (.<status> == New) {
             given self.compile( $name, .<cache-key>, .<path>, .<status> ) {
                 if .<error>.defined {
@@ -97,13 +94,12 @@ method !load-from-cache(Str $name) {
                 }
                 else {
                     %!files{ .<source-name> }<handle status added> = .<handle>, .<status>, .<added>;
-                    $updates = True;
+                    self.save-index;
                 }
             }
         }
         .<handle> or die "No handle for <$name> in cache, but marked as existing.",
                     " Cache corrupted.";
-        self.save-index if $updates;
     }
 }
 
@@ -112,21 +108,16 @@ method !add-file-to-cache(Str $pod-file) {
     # Normalise the cache name to lower case
     $nm = $nm.subst(/ \. \w+ $/, '').lc;
 
-
-    note "Adding '$nm' ($pod-file) to cache ({ %!files{$nm} // 'NULL' })";
     if %!files{$nm}:exists { # cannot use SetHash removal here because duplicates would then register as New
         if %!files{$nm}<path> eq $pod-file {
-            note "Have the path: '%!files{$nm}<path>'";
             # detect tainted source
             %!files{$nm}<status> = Valid if %!files{$nm}<added> < %!files{$nm}<path>.IO.modified;
         }
         else {
-            note "Maybe duplicates --- XXX handle this via exception.";
             @!error-messages.push("$pod-file duplicates name of " ~ %!files{$nm}<path> ~ " but with different extension");
         }
     }
     else {
-        note "Adding new cache entry on the spot";
         %!files{$nm} = (:cache-key(nqp::sha1($nm)), :path($pod-file), :status( New ), :added(0) ).hash;
     }
 
@@ -280,7 +271,6 @@ method pod( Str $source-name ) is export {
     unless %!files{$source-name}:exists {
         if $!lazy {
             my $pod-file = self!find-pod-file-of-name($source-name);
-            note "Found '$pod-file' for '$source-name'";
             self!add-file-to-cache($pod-file);
         }
         else {
